@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          xcodebuild -project Reddot/Reddot.xcodeproj \
+            -scheme Reddot \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package
+        run: |
+          cd build/Build/Products/Release
+          zip -r -y Reddot.zip Reddot.app
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Build/Products/Release/Reddot.zip
+          generate_release_notes: true
