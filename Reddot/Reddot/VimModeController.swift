@@ -89,8 +89,14 @@ class VimModeController {
             }
             if let char = KeyCode.letterForKeyCode(keyCode),
                let matched = pendingHints.first(where: { $0.label == char }) {
+                let clickPoint = matched.position
                 exitHintMode()
-                simulateClick(at: matched.position)
+                // 在后台线程延迟执行点击，确保浮窗已 dismiss、应用已获焦
+                DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                    // 等浮窗 dismiss 完成（main queue 上的 orderOut）
+                    usleep(100_000)
+                    self?.simulateClick(at: clickPoint)
+                }
                 return nil
             }
             // 吞掉其他按键
@@ -144,17 +150,27 @@ class VimModeController {
     // MARK: - 模拟点击
 
     private func simulateClick(at point: CGPoint) {
-        // 先激活目标应用，确保点击事件能正确送达
-        if let frontApp = NSWorkspace.shared.frontmostApplication {
-            frontApp.activate()
+        // 1. 先移动鼠标到目标位置（触发 hover 状态，某些应用需要）
+        if let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                   mouseCursorPosition: point, mouseButton: .left) {
+            moveEvent.post(tap: .cghidEventTap)
         }
+        usleep(30_000) // 30ms 等应用处理 hover
 
-        let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
-        let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
-        mouseDown?.post(tap: .cghidEventTap)
-        // 50ms 延迟让目标应用处理 mouseDown
-        usleep(50_000)
-        mouseUp?.post(tap: .cghidEventTap)
+        // 2. mouseDown
+        if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                   mouseCursorPosition: point, mouseButton: .left) {
+            mouseDown.setIntegerValueField(.mouseEventClickState, value: 1)
+            mouseDown.post(tap: .cghidEventTap)
+        }
+        usleep(50_000) // 50ms 模拟真实点击间隔
+
+        // 3. mouseUp
+        if let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                                 mouseCursorPosition: point, mouseButton: .left) {
+            mouseUp.setIntegerValueField(.mouseEventClickState, value: 1)
+            mouseUp.post(tap: .cghidEventTap)
+        }
     }
 }
 

@@ -33,7 +33,7 @@ class HintOverlayWindow {
             guard let screen = NSScreen.main else { continue }
             let flippedY = screen.frame.height - hint.position.y - tagSize.height / 2
             let origin = NSPoint(
-                x: hint.position.x + 2,
+                x: hint.position.x + 10,
                 y: flippedY
             )
 
