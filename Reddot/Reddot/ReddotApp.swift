@@ -38,9 +38,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 检查屏幕录制权限（图像识别红点需要）
-        if !checkScreenRecordingPermission() {
-            showScreenRecordingAlert()
+        // 异步检查屏幕录制权限
+        Task.detached {
+            do {
+                _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.showScreenRecordingAlert()
+                }
+            }
         }
 
         startServices()
@@ -80,23 +86,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    /// 尝试获取可共享内容来检测屏幕录制权限
-    private func checkScreenRecordingPermission() -> Bool {
-        var hasPermission = false
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            do {
-                _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                hasPermission = true
-            } catch {
-                hasPermission = false
-            }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return hasPermission
-    }
-
     private func showScreenRecordingAlert() {
         let alert = NSAlert()
         alert.messageText = "需要屏幕录制权限"
@@ -115,17 +104,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         vimModeController = VimModeController()
         vimModeController?.start()
 
-        badgeMonitor = DockBadgeMonitor { [weak self] appName, bundleId, badgeValue in
-            self?.handleBadgeDetected(appName: appName, bundleId: bundleId, badgeValue: badgeValue)
+        badgeMonitor = DockBadgeMonitor { appName, bundleId, badgeValue in
+            print("[Reddot] Badge detected: \(appName) (\(bundleId)) = \(badgeValue)")
+            DispatchQueue.main.async {
+                Self.activateApp(bundleId: bundleId)
+            }
         }
         badgeMonitor?.startMonitoring()
         updateMenu(monitoring: true)
+        print("[Reddot] Services started, monitoring Dock badges...")
     }
 
-    private func handleBadgeDetected(appName: String, bundleId: String, badgeValue: String) {
-        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
-            app.activate(options: [.activateIgnoringOtherApps])
+    private static func activateApp(bundleId: String) {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else {
+            print("[Reddot] App not found for bundleId: \(bundleId)")
+            return
         }
+        let success = app.activate()
+        print("[Reddot] Activate \(app.localizedName ?? bundleId): \(success)")
     }
 
     private func updateMenu(monitoring: Bool) {

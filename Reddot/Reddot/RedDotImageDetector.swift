@@ -11,23 +11,12 @@ import ScreenCaptureKit
 
 class RedDotImageDetector {
 
-    /// 检测前台应用窗口中的红点，返回屏幕坐标列表（同步阻塞调用）
-    static func detect() -> [CGPoint] {
-        // ScreenCaptureKit 是异步 API，用信号量做同步桥接
-        var result: [CGPoint] = []
-        let semaphore = DispatchSemaphore(value: 0)
-
-        Task {
-            result = await detectAsync()
-            semaphore.signal()
+    /// 异步检测前台应用窗口中的红点，返回屏幕坐标列表
+    static func detectAsync() async -> [CGPoint] {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            print("[Reddot] No frontmost application")
+            return []
         }
-
-        semaphore.wait()
-        return result
-    }
-
-    private static func detectAsync() async -> [CGPoint] {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return [] }
 
         // 获取可共享内容
         let content: SCShareableContent
@@ -45,6 +34,7 @@ class RedDotImageDetector {
             && $0.frame.width > 50
             && $0.frame.height > 50
         }) else {
+            print("[Reddot] No matching window found")
             return []
         }
 
@@ -53,8 +43,10 @@ class RedDotImageDetector {
         // 配置截图：只截取目标窗口
         let filter = SCContentFilter(desktopIndependentWindow: targetWindow)
         let config = SCStreamConfiguration()
-        config.width = Int(windowFrame.width)
-        config.height = Int(windowFrame.height)
+        // Retina 屏幕下需要用像素尺寸，否则截图是 2x 但 config 是 1x，导致缩放错误
+        let scaleFactor = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+        config.width = Int(windowFrame.width * scaleFactor)
+        config.height = Int(windowFrame.height * scaleFactor)
         config.scalesToFit = false
         config.showsCursor = false
         config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -67,26 +59,24 @@ class RedDotImageDetector {
             print("[Reddot] Screenshot failed: \(error)")
             return []
         }
+        print("[Reddot] Screenshot: \(cgImage.width)x\(cgImage.height) scaleFactor=\(scaleFactor)")
 
         // 在图像中检测红点
         let imagePoints = findRedDots(in: cgImage)
+        print("[Reddot] findRedDots returned \(imagePoints.count) image points")
 
         // 图像坐标 -> 屏幕坐标
         // ScreenCaptureKit 的 frame 是 Quartz 坐标系（左上角原点）
         let scaleX = windowFrame.width / CGFloat(cgImage.width)
         let scaleY = windowFrame.height / CGFloat(cgImage.height)
 
-        // SCWindow.frame 使用屏幕坐标（左上角原点在 macOS Quartz 中是顶部），
-        // 但 macOS 屏幕坐标实际以左下角为原点，SCKit 的 frame.origin.y 是从顶部算的
-        guard let screen = NSScreen.main else { return [] }
-        let screenHeight = screen.frame.height
+        // SCWindow.frame 使用 Quartz 坐标系（左上角原点），CGEvent 鼠标坐标也是左上角原点
+        // 所以直接用 windowFrame.origin + 图像内偏移即可
 
         return imagePoints.map { pt in
             CGPoint(
-                // x: 窗口左边 + 图像内偏移
                 x: windowFrame.origin.x + pt.x * scaleX,
-                // y: 需要从 Quartz(左上原点) 转为 CG 事件坐标(也是左上原点)
-                y: (screenHeight - windowFrame.origin.y - windowFrame.height) + pt.y * scaleY
+                y: windowFrame.origin.y + pt.y * scaleY
             )
         }
     }
@@ -107,9 +97,7 @@ class RedDotImageDetector {
         let bytesPerRow = image.bytesPerRow
 
         // 判断像素格式（BGRA vs RGBA）
-        let isBGRA = image.bitmapInfo.contains(.byteOrder32Little) ||
-                     image.pixelFormatInfo == .packed ||
-                     bytesPerPixel == 4 // ScreenCaptureKit 默认 BGRA
+        let isBGRA = image.bitmapInfo.contains(.byteOrder32Little)
 
         // 1. 生成红色掩码
         var redMask = [Bool](repeating: false, count: width * height)
@@ -136,6 +124,8 @@ class RedDotImageDetector {
             }
         }
 
+        let redPixelCount = redMask.filter { $0 }.count
+
         // 2. 连通域标记 (4-连通 flood fill)
         var labels = [Int](repeating: 0, count: width * height)
         var currentLabel = 0
@@ -157,35 +147,98 @@ class RedDotImageDetector {
             }
         }
 
-        // 3. 形状过滤
+        print("[Reddot] Red pixels: \(redPixelCount), regions: \(regions.count)")
+
+        // 3. 合并邻近区域（带数字的 badge 内部白色文字会把红色背景切成多个碎片）
+        let merged = mergeNearbyRegions(Array(regions.values), gap: 3)
+        print("[Reddot] After merge: \(merged.count) candidates")
+
+        // 4. 形状过滤
         var results: [CGPoint] = []
 
-        for (_, region) in regions {
+        for region in merged {
             let rw = region.maxX - region.minX + 1
             let rh = region.maxY - region.minY + 1
+            let boxArea = rw * rh
 
-            // 面积过滤
             let area = region.count
-            if area < 12 || area > 1300 { continue }
-
-            // 宽高过滤
-            if rw < 4 || rh < 4 { continue }
-            if rw > 45 || rh > 45 { continue }
-
-            // 宽高比接近 1:1
             let aspect = CGFloat(rw) / CGFloat(rh)
-            if aspect < 0.4 || aspect > 2.5 { continue }
+            // 用 bounding box 面积算填充率，合并后的 badge 红色占 bbox 约 50-80%
+            let fillRatio = CGFloat(area) / CGFloat(boxArea)
 
-            // 填充率
-            let fillRatio = CGFloat(area) / CGFloat(rw * rh)
-            if fillRatio < 0.4 { continue }
+            // 纯红点：小面积、高填充率
+            // 数字 badge：较大面积、红色占 bbox 40%+ (白字占了部分空间)
+            if area < 20 { continue }
+            if area > 3000 { continue }
+            if rw < 5 || rh < 5 { continue }
+            if rw > 60 || rh > 40 { continue }
+
+            // 宽高比：纯红点接近 1:1，数字 badge 可能稍宽（如 "99+"）
+            if aspect < 0.5 || aspect > 3.0 { continue }
+
+            // 填充率：纯红点 >0.55，数字 badge 红色部分占 bbox 约 0.35+
+            if fillRatio < 0.35 { continue }
 
             let cx = CGFloat(region.minX + region.maxX) / 2.0
             let cy = CGFloat(region.minY + region.maxY) / 2.0
             results.append(CGPoint(x: cx, y: cy))
         }
 
+        // 按位置稳定排序：先按 y 分行（容差 20px），同行按 x 从左到右
+        results.sort { a, b in
+            let rowA = Int(a.y / 20)
+            let rowB = Int(b.y / 20)
+            if rowA != rowB { return rowA < rowB }
+            return a.x < b.x
+        }
+
         return results
+    }
+
+    /// 合并 bounding box 接近的区域（间距 <= gap 像素）
+    /// 带数字的 badge 红色背景会被白色文字切成多个碎片，合并后恢复为一个整体
+    private static func mergeNearbyRegions(
+        _ regions: [(minX: Int, minY: Int, maxX: Int, maxY: Int, count: Int)],
+        gap: Int
+    ) -> [(minX: Int, minY: Int, maxX: Int, maxY: Int, count: Int)] {
+        guard !regions.isEmpty else { return [] }
+
+        var merged = regions
+        var changed = true
+
+        while changed {
+            changed = false
+            var i = 0
+            while i < merged.count {
+                var j = i + 1
+                while j < merged.count {
+                    let a = merged[i]
+                    let b = merged[j]
+
+                    // 检查两个 bounding box 是否在 gap 范围内相邻或重叠
+                    let overlapX = a.minX <= b.maxX + gap && b.minX <= a.maxX + gap
+                    let overlapY = a.minY <= b.maxY + gap && b.minY <= a.maxY + gap
+
+                    if overlapX && overlapY {
+                        // 合并
+                        merged[i] = (
+                            minX: min(a.minX, b.minX),
+                            minY: min(a.minY, b.minY),
+                            maxX: max(a.maxX, b.maxX),
+                            maxY: max(a.maxY, b.maxY),
+                            count: a.count + b.count
+                        )
+                        merged.remove(at: j)
+                        changed = true
+                    } else {
+                        j += 1
+                    }
+                }
+                i += 1
+            }
+        }
+
+        return merged
     }
 
     /// 判断一个像素是否为"红色"（HSB 空间）
@@ -194,10 +247,10 @@ class RedDotImageDetector {
         let minC = min(r, g, b)
         let delta = maxC - minC
 
-        if maxC < 0.35 { return false }
+        if maxC < 0.50 { return false }
 
         let saturation = maxC > 0 ? delta / maxC : 0
-        if saturation < 0.45 { return false }
+        if saturation < 0.60 { return false }
 
         guard delta > 0 else { return false }
         var hue: CGFloat
@@ -211,7 +264,7 @@ class RedDotImageDetector {
         }
         hue *= 60
 
-        return hue <= 25 || hue >= 335
+        return hue <= 15 || hue >= 345
     }
 
     /// 4-连通 flood fill

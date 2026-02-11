@@ -110,24 +110,28 @@ class VimModeController {
     // MARK: - Hint Mode
 
     private func enterHintMode() {
-        let dots = RedDotImageDetector.detect()
-        if dots.isEmpty {
-            DispatchQueue.main.async { ModeIndicatorWindow.show(text: "NO BADGE") }
-            return
-        }
+        Task.detached { [weak self] in
+            let dots = await RedDotImageDetector.detectAsync()
 
-        let labels = "abcdefghijklmnopqrstuvwxyz"
-        pendingHints = []
-        for (i, pos) in dots.enumerated() {
-            guard i < labels.count else { break }
-            let label = String(labels[labels.index(labels.startIndex, offsetBy: i)])
-            pendingHints.append((label: label, position: pos))
-        }
+            await MainActor.run {
+                guard let self = self else { return }
+                if dots.isEmpty {
+                    ModeIndicatorWindow.show(text: "NO BADGE")
+                    return
+                }
 
-        hintActive = true
-        DispatchQueue.main.async { [weak self] in
-            guard let hints = self?.pendingHints else { return }
-            HintOverlayWindow.show(hints: hints)
+                let labels = "abcdefghijklmnopqrstuvwxyz"
+                self.pendingHints = []
+                for (i, pos) in dots.enumerated() {
+                    guard i < labels.count else { break }
+                    let label = String(labels[labels.index(labels.startIndex, offsetBy: i)])
+                    self.pendingHints.append((label: label, position: pos))
+                }
+
+                self.hintActive = true
+                print("[Reddot] Showing \(self.pendingHints.count) hints")
+                HintOverlayWindow.show(hints: self.pendingHints)
+            }
         }
     }
 
@@ -140,9 +144,16 @@ class VimModeController {
     // MARK: - 模拟点击
 
     private func simulateClick(at point: CGPoint) {
+        // 先激活目标应用，确保点击事件能正确送达
+        if let frontApp = NSWorkspace.shared.frontmostApplication {
+            frontApp.activate()
+        }
+
         let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
         let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
         mouseDown?.post(tap: .cghidEventTap)
+        // 50ms 延迟让目标应用处理 mouseDown
+        usleep(50_000)
         mouseUp?.post(tap: .cghidEventTap)
     }
 }

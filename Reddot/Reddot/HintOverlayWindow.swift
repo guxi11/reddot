@@ -28,12 +28,12 @@ class HintOverlayWindow {
                 height: label.frame.height + paddingV * 2
             )
 
-            // hint.position 是屏幕坐标（左上角原点），NSWindow 使用左下角原点
-            // 将标签放在红点左上角偏移位置
+            // hint.position 是屏幕坐标（Quartz 左上角原点），NSWindow 使用 Cocoa 左下角原点
+            // 将标签放在红点右侧
             guard let screen = NSScreen.main else { continue }
-            let flippedY = screen.frame.height - hint.position.y - tagSize.height
+            let flippedY = screen.frame.height - hint.position.y - tagSize.height / 2
             let origin = NSPoint(
-                x: hint.position.x - tagSize.width - 2,
+                x: hint.position.x + 2,
                 y: flippedY
             )
 
