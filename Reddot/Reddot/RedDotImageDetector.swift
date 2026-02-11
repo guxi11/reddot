@@ -11,8 +11,24 @@ import ScreenCaptureKit
 
 class RedDotImageDetector {
 
+    /// 缓存屏幕缩放因子，避免每次切主线程获取
+    private static var cachedScaleFactor: CGFloat = 0
+
+    private static func getScaleFactor() async -> CGFloat {
+        if cachedScaleFactor > 0 { return cachedScaleFactor }
+        let sf = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+        cachedScaleFactor = sf
+        return sf
+    }
+
+    private static func ms(_ s: Double) -> String {
+        return String(format: "%.0fms", s * 1000)
+    }
+
     /// 异步检测前台应用窗口中的红点，返回屏幕坐标列表
     static func detectAsync() async -> [CGPoint] {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
         guard let frontApp = NSWorkspace.shared.frontmostApplication else {
             print("[Reddot] No frontmost application")
             return []
@@ -26,6 +42,7 @@ class RedDotImageDetector {
             print("[Reddot] Failed to get shareable content: \(error)")
             return []
         }
+        let t1 = CFAbsoluteTimeGetCurrent()
 
         // 找到前台应用的主窗口
         guard let targetWindow = content.windows.first(where: {
@@ -44,7 +61,7 @@ class RedDotImageDetector {
         let filter = SCContentFilter(desktopIndependentWindow: targetWindow)
         let config = SCStreamConfiguration()
         // Retina 屏幕下需要用像素尺寸，否则截图是 2x 但 config 是 1x，导致缩放错误
-        let scaleFactor = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
+        let scaleFactor = await getScaleFactor()
         config.width = Int(windowFrame.width * scaleFactor)
         config.height = Int(windowFrame.height * scaleFactor)
         config.scalesToFit = false
@@ -59,11 +76,14 @@ class RedDotImageDetector {
             print("[Reddot] Screenshot failed: \(error)")
             return []
         }
-        print("[Reddot] Screenshot: \(cgImage.width)x\(cgImage.height) scaleFactor=\(scaleFactor)")
+        print("[Reddot] Screenshot: \(cgImage.width)x\(cgImage.height)")
+        let t2 = CFAbsoluteTimeGetCurrent()
 
         // 在图像中检测红点
         let imagePoints = findRedDots(in: cgImage)
-        print("[Reddot] findRedDots returned \(imagePoints.count) image points")
+        let t3 = CFAbsoluteTimeGetCurrent()
+
+        print("[Reddot] \(imagePoints.count) dots | content=\(ms(t1-t0)) capture=\(ms(t2-t1)) detect=\(ms(t3-t2)) total=\(ms(t3-t0))")
 
         // 图像坐标 -> 屏幕坐标
         // ScreenCaptureKit 的 frame 是 Quartz 坐标系（左上角原点）
@@ -87,71 +107,90 @@ class RedDotImageDetector {
     private static func findRedDots(in image: CGImage) -> [CGPoint] {
         let width = image.width
         let height = image.height
+        let totalPixels = width * height
 
         guard let data = image.dataProvider?.data,
               let ptr = CFDataGetBytePtr(data) else {
             return []
         }
 
-        let bytesPerPixel = image.bitsPerPixel / 8
         let bytesPerRow = image.bytesPerRow
 
-        // 判断像素格式（BGRA vs RGBA）
-        let isBGRA = image.bitmapInfo.contains(.byteOrder32Little)
+        // 1. 生成红色掩码（UInt8: 0=非红, 1=红）+ 同时计数
+        //    ScreenCaptureKit 固定输出 BGRA little-endian，直接按 BGRA 解析
+        let maskPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: totalPixels)
+        maskPtr.initialize(repeating: 0, count: totalPixels)
+        defer { maskPtr.deallocate() }
 
-        // 1. 生成红色掩码
-        var redMask = [Bool](repeating: false, count: width * height)
+        var redPixelCount = 0
 
         for y in 0..<height {
+            let rowBase = y * bytesPerRow
+            let maskRowBase = y * width
             for x in 0..<width {
-                let offset = y * bytesPerRow + x * bytesPerPixel
-                let r: CGFloat
-                let g: CGFloat
-                let b: CGFloat
-                if isBGRA {
-                    b = CGFloat(ptr[offset]) / 255.0
-                    g = CGFloat(ptr[offset + 1]) / 255.0
-                    r = CGFloat(ptr[offset + 2]) / 255.0
-                } else {
-                    r = CGFloat(ptr[offset]) / 255.0
-                    g = CGFloat(ptr[offset + 1]) / 255.0
-                    b = CGFloat(ptr[offset + 2]) / 255.0
-                }
+                let offset = rowBase + x * 4  // BGRA, 4 bytes per pixel
+                let b = ptr[offset]
+                let g = ptr[offset + 1]
+                let r = ptr[offset + 2]
 
-                if isRedPixel(r: r, g: g, b: b) {
-                    redMask[y * width + x] = true
+                if isRedPixelFast(r: r, g: g, b: b) {
+                    maskPtr[maskRowBase + x] = 1
+                    redPixelCount += 1
                 }
             }
         }
 
-        let redPixelCount = redMask.filter { $0 }.count
-
         // 2. 连通域标记 (4-连通 flood fill)
-        var labels = [Int](repeating: 0, count: width * height)
-        var currentLabel = 0
-        var regions: [Int: (minX: Int, minY: Int, maxX: Int, maxY: Int, count: Int)] = [:]
+        //    labels: 0=未标记, >0=标签号
+        let labelsPtr = UnsafeMutablePointer<Int32>.allocate(capacity: totalPixels)
+        labelsPtr.initialize(repeating: 0, count: totalPixels)
+        defer { labelsPtr.deallocate() }
+
+        var currentLabel: Int32 = 0
+        var regions: [(minX: Int, minY: Int, maxX: Int, maxY: Int, count: Int)] = []
+        // 预分配 flood fill 栈，避免反复 append/removeLast 的堆分配
+        var stack: [(Int, Int)] = []
+        stack.reserveCapacity(1024)
 
         for y in 0..<height {
+            let maskRowBase = y * width
             for x in 0..<width {
-                let idx = y * width + x
-                if redMask[idx] && labels[idx] == 0 {
+                let idx = maskRowBase + x
+                if maskPtr[idx] == 1 && labelsPtr[idx] == 0 {
                     currentLabel += 1
-                    let region = floodFill(
-                        mask: &redMask, labels: &labels,
-                        startX: x, startY: y,
-                        width: width, height: height,
-                        label: currentLabel
-                    )
-                    regions[currentLabel] = region
+                    // inline flood fill
+                    stack.append((x, y))
+                    var minX = x, minY = y, maxX = x, maxY = y
+                    var count = 0
+
+                    while !stack.isEmpty {
+                        let (cx, cy) = stack.removeLast()
+                        guard cx >= 0 && cx < width && cy >= 0 && cy < height else { continue }
+                        let fIdx = cy * width + cx
+                        guard maskPtr[fIdx] == 1 && labelsPtr[fIdx] == 0 else { continue }
+
+                        labelsPtr[fIdx] = currentLabel
+                        count += 1
+                        if cx < minX { minX = cx }
+                        if cy < minY { minY = cy }
+                        if cx > maxX { maxX = cx }
+                        if cy > maxY { maxY = cy }
+
+                        stack.append((cx + 1, cy))
+                        stack.append((cx - 1, cy))
+                        stack.append((cx, cy + 1))
+                        stack.append((cx, cy - 1))
+                    }
+
+                    regions.append((minX, minY, maxX, maxY, count))
                 }
             }
         }
 
         print("[Reddot] Red pixels: \(redPixelCount), regions: \(regions.count)")
 
-        // 3. 合并邻近区域（带数字的 badge 内部白色文字会把红色背景切成多个碎片）
-        let merged = mergeNearbyRegions(Array(regions.values), gap: 3)
-        print("[Reddot] After merge: \(merged.count) candidates")
+        // 3. 合并邻近区域
+        let merged = mergeNearbyRegions(regions, gap: 3)
 
         // 4. 形状过滤
         var results: [CGPoint] = []
@@ -163,20 +202,13 @@ class RedDotImageDetector {
 
             let area = region.count
             let aspect = CGFloat(rw) / CGFloat(rh)
-            // 用 bounding box 面积算填充率，合并后的 badge 红色占 bbox 约 50-80%
             let fillRatio = CGFloat(area) / CGFloat(boxArea)
 
-            // 纯红点：小面积、高填充率
-            // 数字 badge：较大面积、红色占 bbox 40%+ (白字占了部分空间)
             if area < 20 { continue }
             if area > 3000 { continue }
             if rw < 5 || rh < 5 { continue }
             if rw > 60 || rh > 40 { continue }
-
-            // 宽高比：纯红点接近 1:1，数字 badge 可能稍宽（如 "99+"）
             if aspect < 0.5 || aspect > 3.0 { continue }
-
-            // 填充率：纯红点 >0.55，数字 badge 红色部分占 bbox 约 0.35+
             if fillRatio < 0.35 { continue }
 
             let cx = CGFloat(region.minX + region.maxX) / 2.0
@@ -241,63 +273,31 @@ class RedDotImageDetector {
         return merged
     }
 
-    /// 判断一个像素是否为"红色"（HSB 空间）
-    private static func isRedPixel(r: CGFloat, g: CGFloat, b: CGFloat) -> Bool {
+    /// 判断一个像素是否为"红色"（纯整数运算，避免浮点开销）
+    /// 等效于 HSB: H ∈ [345°,360°]∪[0°,15°], S ≥ 0.60, V ≥ 0.50
+    @inline(__always)
+    private static func isRedPixelFast(r: UInt8, g: UInt8, b: UInt8) -> Bool {
+        // V ≥ 0.50 → maxC >= 128
         let maxC = max(r, g, b)
+        if maxC < 128 { return false }
+
+        // S ≥ 0.60 → delta/maxC >= 0.6 → delta*255 >= maxC*153 (153 = 0.6*255)
         let minC = min(r, g, b)
-        let delta = maxC - minC
+        let delta = Int(maxC) - Int(minC)
+        if delta == 0 { return false }
+        if delta * 255 < Int(maxC) * 153 { return false }
 
-        if maxC < 0.50 { return false }
+        // R 必须是最大分量（红色色相区间）
+        if r != maxC { return false }
 
-        let saturation = maxC > 0 ? delta / maxC : 0
-        if saturation < 0.60 { return false }
-
-        guard delta > 0 else { return false }
-        var hue: CGFloat
-        if maxC == r {
-            hue = (g - b) / delta
-            if hue < 0 { hue += 6 }
-        } else if maxC == g {
-            hue = 2 + (b - r) / delta
-        } else {
-            hue = 4 + (r - g) / delta
-        }
-        hue *= 60
-
-        return hue <= 15 || hue >= 345
-    }
-
-    /// 4-连通 flood fill
-    private static func floodFill(
-        mask: inout [Bool], labels: inout [Int],
-        startX: Int, startY: Int,
-        width: Int, height: Int,
-        label: Int
-    ) -> (minX: Int, minY: Int, maxX: Int, maxY: Int, count: Int) {
-        var stack = [(startX, startY)]
-        var minX = startX, minY = startY, maxX = startX, maxY = startY
-        var count = 0
-
-        while !stack.isEmpty {
-            let (x, y) = stack.removeLast()
-            let idx = y * width + x
-
-            guard x >= 0 && x < width && y >= 0 && y < height else { continue }
-            guard mask[idx] && labels[idx] == 0 else { continue }
-
-            labels[idx] = label
-            count += 1
-            minX = min(minX, x)
-            minY = min(minY, y)
-            maxX = max(maxX, x)
-            maxY = max(maxY, y)
-
-            stack.append((x + 1, y))
-            stack.append((x - 1, y))
-            stack.append((x, y + 1))
-            stack.append((x, y - 1))
-        }
-
-        return (minX, minY, maxX, maxY, count)
+        // H 计算: hue6 = (g - b) / delta，范围 [-1, 1] 对应 [330°, 30°] 附近
+        // hue_deg = hue6 * 60
+        // 我们要 hue <= 15° || hue >= 345°
+        // → hue6 <= 0.25 || hue6 >= 5.75  (在 [0,6) 范围)
+        // → (g - b) / delta <= 0.25 || (g - b) / delta + 6 >= 5.75 (当 g < b)
+        // → (g - b) * 4 <= delta || (g - b) * 4 >= -delta  (当 g < b，即 (g-b+6)*60 >= 345 → (g-b)/delta >= -0.25)
+        // 简化: |g - b| * 4 <= delta
+        let diff = abs(Int(g) - Int(b))
+        return diff * 4 <= delta
     }
 }
