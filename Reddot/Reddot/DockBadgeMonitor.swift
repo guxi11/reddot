@@ -18,20 +18,36 @@ class DockBadgeMonitor {
     private let onBadgeChange: BadgeChangeHandler
     private let pollingInterval: TimeInterval = 1.0
 
-    // MARK: - 节流: 同一 app 首次变化立即触发，之后 10s 内忽略
-    private let throttleInterval: TimeInterval = 10.0
+    // MARK: - 节流: 同一 app 首次变化立即触发，之后冷却期内忽略
+    var throttleInterval: TimeInterval
     /// bundleId -> 上次触发回调的时间
     private var lastFireTime: [String: Date] = [:]
 
-    // MARK: - 输入抑制: 用户正在输入或输入结束 3s 内不触发
-    private let inputCooldown: TimeInterval = 3.0
+    // MARK: - 输入抑制: 用户正在输入或输入结束后 cooldown 内不触发
+    var inputCooldown: TimeInterval
+
+    // MARK: - 忽略列表
+    var ignoredBundleIds: Set<String> = []
+
+    /// 最近扫描到的有 Badge 的 app 列表 (name, bundleId)
+    var knownApps: [(name: String, bundleId: String)] {
+        return previousBadges.keys.sorted().map { bundleId in
+            (name: appNameForBundleId(bundleId), bundleId: bundleId)
+        }
+    }
     private var eventMonitor: Any?
     /// 上次键盘/输入事件的时间戳
     private var lastInputTime: Date = .distantPast
     /// 当前是否处于 composing (marked text) 状态
     private var isComposing: Bool = false
 
-    init(onBadgeChange: @escaping BadgeChangeHandler) {
+    init(throttleInterval: TimeInterval = 10.0,
+         inputCooldown: TimeInterval = 3.0,
+         ignoredBundleIds: Set<String> = [],
+         onBadgeChange: @escaping BadgeChangeHandler) {
+        self.throttleInterval = throttleInterval
+        self.inputCooldown = inputCooldown
+        self.ignoredBundleIds = ignoredBundleIds
         self.onBadgeChange = onBadgeChange
     }
 
@@ -105,6 +121,9 @@ class DockBadgeMonitor {
         let currentBadges = scanDockBadges()
 
         for (bundleId, badgeValue) in currentBadges {
+            // 忽略列表中的 app 不触发回调
+            guard !ignoredBundleIds.contains(bundleId) else { continue }
+
             let previousValue = previousBadges[bundleId]
             if previousValue == nil || previousValue != badgeValue {
                 throttledCallback(bundleId: bundleId, badgeValue: badgeValue)

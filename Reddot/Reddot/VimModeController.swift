@@ -15,6 +15,9 @@ class VimModeController {
     private var hintActive = false
     private var pendingHints: [(label: String, position: CGPoint)] = []
 
+    /// 持续模式：点击红点后自动重新进入 hint mode
+    var persistentMode = false
+
     init() {}
 
     /// 启动全局快捷键监听（应用启动时调用一次）
@@ -90,12 +93,20 @@ class VimModeController {
             if let char = KeyCode.letterForKeyCode(keyCode),
                let matched = pendingHints.first(where: { $0.label == char }) {
                 let clickPoint = matched.position
+                let shouldReenter = persistentMode
                 exitHintMode()
                 // 在后台线程延迟执行点击，确保浮窗已 dismiss、应用已获焦
                 DispatchQueue.global(qos: .userInteractive).async { [weak self] in
                     // 等浮窗 dismiss 完成（main queue 上的 orderOut）
                     usleep(100_000)
                     self?.simulateClick(at: clickPoint)
+                    // 持续模式：点击后自动重新进入 hint mode
+                    if shouldReenter {
+                        usleep(500_000) // 500ms 等页面响应
+                        DispatchQueue.main.async {
+                            self?.enterHintMode()
+                        }
+                    }
                 }
                 return nil
             }
