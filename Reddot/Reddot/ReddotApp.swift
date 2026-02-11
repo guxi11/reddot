@@ -347,8 +347,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("[Reddot] App not found for bundleId: \(bundleId)")
             return
         }
+
+        // 先尝试常规激活
         let success = app.activate()
         print("[Reddot] Activate \(app.localizedName ?? bundleId): \(success)")
+
+        // 如果 app 没有可见窗口（用户已关闭所有窗口），通过 open 重新打开
+        if !appHasVisibleWindow(app) {
+            print("[Reddot] No visible window for \(app.localizedName ?? bundleId), reopening...")
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+                NSWorkspace.shared.openApplication(at: url,
+                                                   configuration: NSWorkspace.OpenConfiguration())
+            }
+        }
+    }
+
+    /// 检查 app 是否有可见窗口（通过 Accessibility API）
+    private static func appHasVisibleWindow(_ app: NSRunningApplication) -> Bool {
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            return false
+        }
+        // 至少有一个非最小化的窗口
+        for window in windows {
+            var minimizedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
+               let minimized = minimizedRef as? Bool, minimized {
+                continue
+            }
+            return true
+        }
+        return false
     }
     
     private func isAutoActivationDisabled() -> Bool {
