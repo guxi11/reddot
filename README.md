@@ -32,6 +32,12 @@ Reddot will **not** switch apps while you are typing. It monitors keyboard activ
 
 Download `Reddot.zip` from [Releases](../../releases/latest), unzip and drag `Reddot.app` to Applications.
 
+If macOS shows *"Reddot is damaged and can't be opened"*, run:
+
+```bash
+xattr -cr /Applications/Reddot.app
+```
+
 ## Build from Source
 
 Open `Reddot/Reddot.xcodeproj` in Xcode and build.
