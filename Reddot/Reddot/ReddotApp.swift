@@ -29,11 +29,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let userDefaults = UserDefaults.standard
 
     // MARK: - UserDefaults Keys
-    private let autoActivationDisableUntilKey = "autoActivationDisableUntil"
+    private let autoActivationEnabledKey = "autoActivationEnabled"
     private let ignoredAppsKey = "ignoredBundleIds"
     private let throttleIntervalKey = "throttleInterval"
     private let inputCooldownKey = "inputCooldown"
     private let persistentHintModeKey = "persistentHintMode"
+    private let hotkeyCodeKey = "hotkeyCode"
 
     // MARK: - 可选档位
     private let throttleOptions: [(title: String, value: TimeInterval)] = [
@@ -47,12 +48,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("3 seconds", 3),
         ("5 seconds", 5),
     ]
+    private let hotkeyOptions: [(title: String, keyCode: Int64)] = [
+        ("Control + A", 0),
+        ("Control + E", 14),
+        ("Control + F", 3),
+        ("Control + G", 5),
+        ("Control + H", 4),
+        ("Control + J", 38),
+        ("Control + K", 40),
+        ("Control + L", 37),
+        ("Control + R", 15),
+    ]
 
     // MARK: - Menu Item Tags (用于定位动态子菜单)
     private let ignoredAppsMenuTag     = 100
     private let throttleMenuTag        = 101
     private let cooldownMenuTag        = 102
     private let persistentHintModeTag  = 103
+    private let hotkeyMenuTag          = 104
+    private let autoActivationMenuTag  = 105
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 隐藏 Dock 图标，纯 MenuBar 应用
@@ -100,6 +114,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return val > 0 ? val : 3.0 // 默认 3s
     }
 
+    private func loadHotkeyCode() -> Int64 {
+        // UserDefaults 不支持 Int64，用 object(forKey:) 判断是否存在
+        if userDefaults.object(forKey: hotkeyCodeKey) != nil {
+            return Int64(userDefaults.integer(forKey: hotkeyCodeKey))
+        }
+        return 14 // 默认 E
+    }
+
     // MARK: - Status Item & Menu
 
     private func setupStatusItem() {
@@ -137,15 +159,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         persistentItem.tag = persistentHintModeTag
         menu.addItem(persistentItem)
 
-        menu.addItem(NSMenuItem.separator())
+        // Hotkey 子菜单
+        let hotkeyItem = NSMenuItem(title: "Hotkey", action: nil, keyEquivalent: "")
+        hotkeyItem.tag = hotkeyMenuTag
+        hotkeyItem.submenu = NSMenu()
+        menu.addItem(hotkeyItem)
 
-        // 禁用自动激活选项
-        let pauseMenu = NSMenuItem(title: "Pause Auto-Activation", action: nil, keyEquivalent: "")
-        let pauseSubmenu = NSMenu()
-        pauseSubmenu.addItem(NSMenuItem(title: "30 Minutes", action: #selector(pauseAutoActivation30m), keyEquivalent: ""))
-        pauseSubmenu.addItem(NSMenuItem(title: "1 Hour", action: #selector(pauseAutoActivation1h), keyEquivalent: ""))
-        pauseMenu.submenu = pauseSubmenu
-        menu.addItem(pauseMenu)
+        // Auto Activation 开关
+        let autoActivationItem = NSMenuItem(title: "Auto Activation", action: #selector(toggleAutoActivation(_:)), keyEquivalent: "")
+        autoActivationItem.tag = autoActivationMenuTag
+        menu.addItem(autoActivationItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
@@ -158,7 +181,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildIgnoredAppsSubmenu()
         rebuildThrottleSubmenu()
         rebuildCooldownSubmenu()
+        rebuildHotkeySubmenu()
         updatePersistentHintModeItem()
+        updateAutoActivationItem()
     }
 
     private func rebuildIgnoredAppsSubmenu() {
@@ -231,10 +256,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func rebuildHotkeySubmenu() {
+        guard let menu = statusItem.menu,
+              let item = menu.item(withTag: hotkeyMenuTag),
+              let submenu = item.submenu else { return }
+
+        submenu.removeAllItems()
+
+        let current = vimModeController?.hotkeyCode ?? loadHotkeyCode()
+        for option in hotkeyOptions {
+            let mi = NSMenuItem(title: option.title, action: #selector(selectHotkey(_:)), keyEquivalent: "")
+            mi.representedObject = option.keyCode
+            mi.state = (current == option.keyCode) ? .on : .off
+            submenu.addItem(mi)
+        }
+    }
+
     private func updatePersistentHintModeItem() {
         guard let menu = statusItem.menu,
               let item = menu.item(withTag: persistentHintModeTag) else { return }
         item.state = (vimModeController?.persistentMode ?? false) ? .on : .off
+    }
+
+    private func updateAutoActivationItem() {
+        guard let menu = statusItem.menu,
+              let item = menu.item(withTag: autoActivationMenuTag) else { return }
+        item.state = loadAutoActivationEnabled() ? .on : .off
+    }
+
+    private func loadAutoActivationEnabled() -> Bool {
+        // 默认 false（关闭）
+        userDefaults.bool(forKey: autoActivationEnabledKey)
     }
 
     // MARK: - Menu Actions
@@ -273,6 +325,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         badgeMonitor?.inputCooldown = value
         userDefaults.set(value, forKey: inputCooldownKey)
         print("[Reddot] Input cooldown set to \(value)s")
+    }
+
+    @objc private func selectHotkey(_ sender: NSMenuItem) {
+        guard let keyCode = sender.representedObject as? Int64 else { return }
+        vimModeController?.hotkeyCode = keyCode
+        userDefaults.set(Int(keyCode), forKey: hotkeyCodeKey)
+        let keyName = hotkeyOptions.first { $0.keyCode == keyCode }?.title ?? "Unknown"
+        print("[Reddot] Hotkey set to \(keyName)")
+    }
+
+    @objc private func toggleAutoActivation(_ sender: NSMenuItem) {
+        let newValue = !loadAutoActivationEnabled()
+        userDefaults.set(newValue, forKey: autoActivationEnabledKey)
+        print("[Reddot] Auto activation: \(newValue)")
     }
 
     // MARK: - Permissions
@@ -317,6 +383,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func startServices() {
         vimModeController = VimModeController()
         vimModeController?.persistentMode = userDefaults.bool(forKey: persistentHintModeKey)
+        vimModeController?.hotkeyCode = loadHotkeyCode()
         vimModeController?.start()
 
         let ignoredApps = loadIgnoredApps()
@@ -330,8 +397,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { [weak self] appName, bundleId, badgeValue in
             print("[Reddot] Badge detected: \(appName) (\(bundleId)) = \(badgeValue)")
             DispatchQueue.main.async {
-                if self?.isAutoActivationDisabled() ?? false {
-                    print("[Reddot] Auto-activation is paused, ignoring badge change")
+                guard self?.loadAutoActivationEnabled() == true else {
+                    print("[Reddot] Auto-activation is disabled, ignoring badge change")
                     return
                 }
                 Self.activateApp(bundleId: bundleId)
@@ -382,24 +449,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
     
-    private func isAutoActivationDisabled() -> Bool {
-        guard let disableUntil = userDefaults.object(forKey: autoActivationDisableUntilKey) as? Date else {
-            return false
-        }
-        return Date() < disableUntil
-    }
-    
-    @objc private func pauseAutoActivation30m() {
-        let disableUntil = Date().addingTimeInterval(30 * 60)
-        userDefaults.set(disableUntil, forKey: autoActivationDisableUntilKey)
-        print("[Reddot] Auto-activation paused until \(disableUntil)")
-    }
-    
-    @objc private func pauseAutoActivation1h() {
-        let disableUntil = Date().addingTimeInterval(60 * 60)
-        userDefaults.set(disableUntil, forKey: autoActivationDisableUntilKey)
-        print("[Reddot] Auto-activation paused until \(disableUntil)")
-    }
 
     private func updateMenu(monitoring: Bool) {
         guard let menu = statusItem.menu, let firstItem = menu.items.first else { return }

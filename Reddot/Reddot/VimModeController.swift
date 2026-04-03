@@ -2,8 +2,8 @@
 //  VimModeController.swift
 //  Reddot
 //
-//  全局监听 Control+f 进入 hint 模式，显示 Vimium 风格字母标签，
-//  按对应字母点击红点，按 Esc 取消。
+//  全局监听快捷键（默认 Control+E）进入 hint 模式，显示 Vimium 风格字母标签，
+//  按对应字母点击红点，按 Esc 取消。支持自定义快捷键。
 //
 
 import AppKit
@@ -17,6 +17,9 @@ class VimModeController {
 
     /// 持续模式：点击红点后自动重新进入 hint mode
     var persistentMode = false
+
+    /// 触发 hint mode 的快捷键 keyCode（默认 14 = E）
+    var hotkeyCode: Int64 = 14
 
     init() {}
 
@@ -114,8 +117,8 @@ class VimModeController {
             return nil
         }
 
-        // 非 hint 模式：只拦截 Control+f
-        if keyCode == 3 && flags.contains(.maskControl) {
+        // 非 hint 模式：只拦截 Control+自定义键（默认 E）
+        if keyCode == hotkeyCode && flags.contains(.maskControl) {
             enterHintMode()
             return nil
         }
